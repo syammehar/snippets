@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width" />
+    <title>JS Pendulum</title>
+</head>
+<body>
+    <canvas id="myCanvas" style=""width="200" height="150"></canvas>
+    <script>
+        var canvas = document.getElementById("myCanvas");
+        var ctx = canvas.getContext("2d");
+        //ctx.fillStyle = "#000000";
+
+        var angle = Math.PI/6;//30 degrees
+
+        var factor = 0,
+            time = 0,
+            deltaX = 0,
+            deltaY = 0,
+            l = 100,
+            xOffset = 100;
+
+        (async function () {
+            while (true) {
+                factor = (angle * Math.sin(time / 57.29577951308232));
+                deltaX = l * Math.sin(factor);
+                deltaY = l * Math.cos(factor);
+
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.beginPath();
+
+                //draw pendulum string
+                ctx.moveTo(xOffset, 0);
+                ctx.lineTo(xOffset + deltaX, deltaY);
+                ctx.stroke();
+
+                //draw pendulum bob
+                ctx.beginPath();
+                ctx.arc(deltaX + xOffset, deltaY, 10, 0, 2 * Math.PI);
+                ctx.fill();
+
+                var wait = 4 + Math.abs(Math.sin(factor) * 5);
+                await sleep(wait);
+
+                time++
+            }
+        })();
+        
+        function sleep(ms) {
+            return new Promise(function (resolve, rejcet) {
+                try {
+                    setTimeout(function () { return resolve(); }, ms)
+                } catch { rejcet() }
+            })
+        }
+    </script>
+</body>
+</html>
