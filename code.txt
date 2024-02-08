@@ -1,0 +1,711 @@
+using FluentValidation;
+using WebApi.Models.Entities;
+using WebApi.ViewModels;
+
+namespace WebApi.Validations
+{
+    public class ArticleValidators
+    {
+        public class AddArticleValidators : AbstractValidator<ArticleVm>
+        {
+            public AddArticleValidators()
+            {
+                RuleFor(x => x.Title).NotNull().Length(1, 100);
+                RuleFor(x => x.TitleAr).NotNull().Length(1, 100);
+                RuleFor(x => x.TitleCh).NotNull().Length(1, 100);
+                RuleFor(x => x.TitleRu).NotNull().Length(1, 100);
+            }
+        }
+
+        public class AddArticleSectionValidators : AbstractValidator<ArticleSectionVm>
+        {
+            public AddArticleSectionValidators()
+            {
+                RuleFor(x => x.Description).NotNull().Length(1, 4000);
+                RuleFor(x => x.DescriptionAr).NotNull().Length(1, 4000);
+                RuleFor(x => x.DescriptionCh).NotNull().Length(1, 4000);
+                RuleFor(x => x.DescriptionRu).NotNull().Length(1, 4000);
+            }
+        }
+    }
+}
+
+
+
+using FluentValidation;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Rewrite;
+using Microsoft.Extensions.FileProviders;
+using Microsoft.IdentityModel.Tokens;
+using System;
+using System.Text;
+using System.Text.Json.Serialization;
+using WebApi.Common;
+using WebApi.Models;
+using WebApi.Persistence;
+using WebApi.Services;
+using WebApi.Services.Common;
+using WebApi.Validations;
+
+var builder = WebApplication.CreateBuilder(args);
+var corsUrls = builder.Configuration.GetValue<string>("CorsUrls").Split(';').ToList();
+
+builder.Services.AddCors();
+
+builder.Logging.AddFile(builder.Configuration.GetSection("Logging"));
+
+// Add services to the container.
+
+
+builder.Services.AddMemoryCache();
+
+builder.Services.AddControllers().AddJsonOptions(opts =>
+{
+    opts.JsonSerializerOptions.NumberHandling = JsonNumberHandling.AllowReadingFromString;
+    opts.JsonSerializerOptions.PropertyNamingPolicy = null;
+});
+
+builder.Services.AddValidatorsFromAssemblyContaining<RegisterValidator>();
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+               .AddJwtBearer(options =>
+               {
+                   options.TokenValidationParameters = new TokenValidationParameters
+                   {
+                       ValidateIssuer = true,
+                       ValidateAudience = true,
+                       ValidateLifetime = true,
+                       ValidateIssuerSigningKey = true,
+                       ValidIssuer = builder.Configuration["Jwt:ValidIssuer"],
+                       ValidAudience = builder.Configuration["Jwt:ValidAudience"],
+                       IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(builder.Configuration["Jwt:Secret"]))
+                   };
+               });
+
+
+builder.Services.AddAuthorization();
+
+//builder.Services.AddAuthorizationHandlers();
+
+builder.Services.AddHttpContextAccessor();
+
+builder.Services.AddDbContext<AppDbContext>();
+builder.Services.AddScoped<UnitOfWork>();
+
+builder.Services.AddScoped<LoggedInUser>();
+
+builder.Services.AddSingleton<EmailService>();
+builder.Services.AddSingleton<EmailServiceGmail>();
+builder.Services.AddSingleton<KeyGenerator>();
+builder.Services.AddSingleton<TokenService>();
+builder.Services.AddSingleton<UploadService>();
+
+builder.Services.AddHttpClient(AppConstants.ApiExchangeRateClientName, x =>
+{
+    x.BaseAddress = new Uri(builder.Configuration.GetValue<string>("ExchangeRateApi"));
+    x.Timeout = TimeSpan.FromSeconds(300);
+});
+
+builder.Services.AddBusinessServices();
+
+var app = builder.Build();
+
+app.UseCors(options =>
+{
+    options.AllowAnyHeader();
+    corsUrls.ForEach(x => options.WithOrigins(x));
+
+    //options.WithOrigins("http://localhost:3000", "http://localhost:4000");
+
+});
+
+app.UseRouting();
+
+//app.UseRewriter(new RewriteOptions().AddRewrite(@"^confirm-email/?$", "/confirm-email/index.html", skipRemainingRules: true));
+
+app.UseStaticFiles(new StaticFileOptions
+{
+    ServeUnknownFileTypes = true,
+    FileProvider = new PhysicalFileProvider(Path.Combine(Directory.GetCurrentDirectory(), "wwwroot")),
+    RequestPath = "",
+    OnPrepareResponse = ctx =>
+    {
+        ctx.Context.Response.Headers.Append("Cache-Control", "public,max-age=3600");
+    }
+});
+
+app.UseMiddleware<ErrorHandlerMiddleware>();
+
+// Configure the HTTP request pipeline.
+
+//app.UseHttpsRedirection();
+
+app.UseAuthentication();
+
+app.UseAuthorization();
+
+app.MapControllers();
+
+app.MapGet("/", () =>
+{
+    return "API is runnig...";
+});
+//app.UseEndpoints(endpoints =>
+//{
+//    endpoints.MapControllers();
+//    endpoints.MapFallbackToFile("index.html");
+//    endpoints.MapGet("/", context =>
+//    {
+//        return context.Response.WriteAsync("API is running...");
+//    });
+//});
+
+app.Run();
+
+
+
+
+using FluentValidation;
+using Microsoft.Extensions.Configuration;
+using Microsoft.VisualBasic;
+using System.Net;
+using System.Security.Claims;
+using System.Text.Json;
+using WebApi.Common.Exceptions;
+
+namespace WebApi.Common
+{
+    public class ErrorHandlerMiddleware
+    {
+        private readonly RequestDelegate _next;
+        private readonly IConfiguration _configuration;
+        private readonly ILogger<ErrorHandlerMiddleware> _logger;
+        public ErrorHandlerMiddleware(RequestDelegate next,
+            ILogger<ErrorHandlerMiddleware> logger,
+            IConfiguration configuration)
+        {
+            _next = next;
+            _logger = logger;
+            _configuration = configuration;
+        }
+
+        public async Task Invoke(HttpContext context)
+        {
+            try
+            {
+                await _next(context);
+            }
+            catch (Exception error)
+            {
+                var response = context.Response;
+                response.ContentType = "application/json";
+
+                if (error is ValidationException validationException)
+                {
+                    await WriteValidationErrorResponse(validationException, response);
+                    return;
+                }
+                if (error is AppBadRequestException badReqException)
+                {
+                    await WriteBadRequestResponse(badReqException, response);
+                    return;
+                }
+                var allowErrorDetails = _configuration.GetValue<bool>("AllowErrorDetails");
+                var showError = allowErrorDetails;// || context.User.Claims.Any(x => x.Type == ClaimTypes.Role && x.Value == Roles.SuperAdmin);
+
+                response.StatusCode = error switch
+                {
+                    KeyNotFoundException e => (int)HttpStatusCode.NotFound,
+                    _ => (int)HttpStatusCode.InternalServerError,
+                };
+
+                var resp = new
+                {
+                    Message = showError ? error?.Message : "Something went wrong please contact the system administrator.",
+                    Details = showError ? error?.ToString() : null,
+                };
+
+                _logger.LogError(error, error?.Message);
+
+                var result = JsonSerializer.Serialize(resp);
+                await response.WriteAsync(result);
+            }
+        }
+
+        private Task WriteBadRequestResponse(AppBadRequestException badReqException, HttpResponse response)
+        {
+            response.StatusCode = (int)HttpStatusCode.BadRequest;
+            var resp = new
+            {
+                badReqException.Message,
+            };
+            var result = JsonSerializer.Serialize(resp);
+            return response.WriteAsync(result);
+        }
+
+        private static Task WriteValidationErrorResponse(ValidationException error, HttpResponse response)
+        {
+            response.StatusCode = (int)HttpStatusCode.BadRequest;
+            var resp = new
+            {
+                Message = "Validation Error",
+                Errors = error.Errors.ToDictionary(x => x.PropertyName, x => x.ErrorMessage)
+            };
+            var result = JsonSerializer.Serialize(resp);
+            return response.WriteAsync(result);
+        }
+    }
+}
+
+
+
+
+
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
+using System.Text.Json.Serialization;
+using Web.Common;
+using Web.Models;
+using Web.Persistence;
+using Web.AuthPolicies;
+using Web.Services;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.FileProviders;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Add services to the container.
+
+builder.Services.AddCors();
+
+//builder.Services.AddLogging();
+
+builder.Logging.AddFile(builder.Configuration.GetSection("Logging"));
+
+builder.Services.AddControllers().AddJsonOptions(opts =>
+{
+    opts.JsonSerializerOptions.NumberHandling = JsonNumberHandling.AllowReadingFromString;
+    opts.JsonSerializerOptions.PropertyNamingPolicy = null;
+});
+builder.Services.AddControllersWithViews();
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+               .AddJwtBearer(options =>
+               {
+                   options.TokenValidationParameters = new TokenValidationParameters
+                   {
+                       ValidateIssuer = true,
+                       ValidateAudience = true,
+                       ValidateLifetime = true,
+                       ValidateIssuerSigningKey = true,
+                       ValidIssuer = builder.Configuration["Jwt:ValidIssuer"],
+                       ValidAudience = builder.Configuration["Jwt:ValidAudience"],
+                       IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(builder.Configuration["Jwt:Secret"]))
+                   };
+               });
+
+builder.Services.AddAuthorization(options =>
+{
+    options.AddAppPolicies();
+});
+
+builder.Services.AddAuthorizationHandlers();
+
+
+builder.Services.AddHttpContextAccessor();
+
+builder.Services.AddDbContext<AppDbContext>();
+builder.Services.AddScoped<UnitOfWork>();
+
+builder.Services.AddScoped<LoggedInUser>();
+
+builder.Services.AddSingleton<EmailService>();
+builder.Services.AddSingleton<TokenService>();
+builder.Services.AddSingleton<UploadService>();
+builder.Services.AddSingleton<VcfGenerator>();
+
+var app = builder.Build();
+
+// Configure the HTTP request pipeline.
+if (!app.Environment.IsDevelopment())
+{
+    // The default HSTS value is 30 days. You may want to change this for production scenarios, see https://aka.ms/aspnetcore-hsts.
+    app.UseHsts();
+}
+
+
+app.UseFileServer(new FileServerOptions
+{
+    FileProvider = new PhysicalFileProvider(
+                    Path.Combine(Directory.GetCurrentDirectory(), "content")),
+    RequestPath = "/content",
+    EnableDefaultFiles = true
+});
+
+//app.UseHttpsRedirection();
+app.UseCors(options => options.AllowAnyOrigin().AllowAnyHeader());
+
+app.UseMiddleware<ErrorHandlerMiddleware>();
+
+app.UseStaticFiles();
+app.UseRouting();
+
+
+app.UseAuthentication();
+//uses bearer token issued from AAD
+app.UseAuthorization();
+
+//app.UseEndpoints(endpoints =>
+//{
+//    endpoints.MapGet("/profile/{*path}", async context =>
+//    {
+//        await context.Response.SendFileAsync("content/profile/index.html");
+//    });
+//});
+
+
+app.MapControllerRoute(
+    name: "default",
+    pattern: "{controller}/{action=Index}/{id?}");
+
+app.MapFallbackToFile("index.html"); ;
+
+app.Run();
+
+
+
+
+
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using System.Data;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
+using WebApi.Models;
+using WebApi.Models.Entities;
+using WebApi.ViewModels;
+using FluentValidation;
+using WebApi.Services.Common;
+using WebApi.Common;
+
+// For more information on enabling Web API for empty projects, visit https://go.microsoft.com/fwlink/?LinkID=397860
+
+namespace WebApi.Controllers
+{
+    public class AuthController : ApiControllerBase
+    {
+        private readonly int _emailTokenLifetimeHours = 12;
+        private readonly IConfiguration _configuration;
+        private readonly LoggedInUser _user;
+        private readonly AppDbContext _db;
+        private readonly EmailService _email;
+        private readonly EmailServiceGmail _email2;
+        private readonly UploadService _upload;
+        private readonly KeyGenerator _keyGen;
+        private readonly IValidator<RegisterUserVm> _validateUser;
+        private readonly IValidator<ChangePasswordModelVm> _validateChangePassword;
+
+        public AuthController(IConfiguration configuration,
+            AppDbContext context,
+            LoggedInUser user,
+            EmailService email,
+            IValidator<RegisterUserVm> validateUser,
+            IValidator<ChangePasswordModelVm> validateChangePassword,
+            KeyGenerator keyGen,
+            UploadService upload,
+            EmailServiceGmail email2)
+        {
+            _configuration = configuration;
+            _db = context;
+            _user = user;
+            _email = email;
+            _validateUser = validateUser;
+            _validateChangePassword = validateChangePassword;
+            _keyGen = keyGen;
+            _upload = upload;
+            _email2 = email2;
+        }
+
+        [HttpGet("test-email")]
+        public async Task<IActionResult> Test()
+        {
+            await _email2.SendEmail("syammehar@gmail.com", "", "test email", "test body");
+            return Ok("email sent");
+
+        }
+
+        [HttpPost("register")]
+        public async Task<IActionResult> Post(RegisterUserVm user)
+        {
+            _validateUser.ValidateAndThrow(user);
+
+            var usersQuery = _db.Users;
+
+            if (await usersQuery.AnyAsync(x => x.Contact == user.Contact))
+            {
+                return BadRequest("User with contact number already exists");
+            }
+            if (await usersQuery.AnyAsync(x => x.Email == user.Email))
+            {
+                return BadRequest("User with email already exists");
+            }
+            var curTime = DateTime.UtcNow;
+            var emailToken = _keyGen.GetUniqueKey(64);
+            var result = await _db.Users.AddAsync(new User
+            {
+                FirstName = user.FirstName,
+                LastName = user.LastName,
+                Email = user.Email,
+                CreatedDate = curTime,
+                UpdatedDate = curTime,
+                Status = UserStatus.InActive,
+                Contact = user.Contact,
+                EmailOtp = emailToken,
+                EmailOtpExpiry = curTime.AddHours(_emailTokenLifetimeHours),
+                Password = BCrypt.Net.BCrypt.HashPassword(user.Password)
+            });
+            await _db.SaveChangesAsync();
+
+            await _email.SendEmailConfirmationToken(user.Email!, result.Entity.Id, user.FirstName!, emailToken);
+
+            var resp = await GenerateToken(result.Entity);
+            return Ok(resp);
+
+        }
+
+        [HttpGet("confirm-email/{userId}/{token}")]
+        public async Task<IActionResult> ConfirmEmail(int userId, string token)
+        {
+            var curTime = DateTime.UtcNow;
+            var user = await _db.Users.FindAsync(userId);
+            if (user is null
+                || string.IsNullOrEmpty(user.EmailOtp)
+                || user.EmailOtp != token)
+            {
+                return BadRequest("Sorry, but we're unable to process your request at the moment.");
+            }
+            if (!user.EmailOtpExpiry.HasValue || curTime > user.EmailOtpExpiry)
+            {
+                return BadRequest("Sorry, your email verification link has expired");
+            }
+            user.EmailOtp = null;
+            user.EmailOtpExpiry = null;
+            user.EmailVerified = true;
+            await _db.SaveChangesAsync();
+            return Ok("Congratulations! Your email has been successfully verified.");
+        }
+
+        [HttpPost("login")]
+        public async Task<IActionResult> Login(LoginModelVm model)
+        {
+            var user = await GetUser(model.Username);
+            if (user is null)
+            {
+                return BadRequest("Invalid email address");
+            }
+            if (user.Status != UserStatus.Normal)
+            {
+                return BadRequest("User Status is not normal");
+            }
+            if (!BCrypt.Net.BCrypt.Verify(model.Password, user.Password))
+            {
+                return BadRequest("Invalid password");
+            }
+            var resp = await GenerateToken(user);
+            return Ok(resp);
+        }
+
+        [HttpPost("refresh-token")]
+        public async Task<IActionResult> RefreshToken(TokenModelVm tokenModel)
+        {
+            if (tokenModel is null)
+            {
+                return BadRequest("Invalid client request.");
+            }
+            string? accessToken = tokenModel.AccessToken;
+            string? refreshToken = tokenModel.RefreshToken;
+            var principal = GetPrincipalFromExpiredToken(accessToken);
+            if (principal == null)
+            {
+                return BadRequest("Invalid access token.");
+            }
+            var username = principal.Claims.FirstOrDefault(x => x.Type == ClaimTypes.NameIdentifier)?.Value ?? "";
+            var user = await GetUser(username);
+            if (user == null)
+            {
+                return BadRequest("Invalid access token 2.");
+            }
+            var tokenObj = await _db.UserTokens.FirstOrDefaultAsync(x => x.UserId == user.Id && x.RefreshToken == refreshToken);
+            if (tokenObj is null || DateTime.UtcNow > tokenObj.ExpiryTime)
+            {
+                return BadRequest("Invalid refresh token.");
+            }
+            //var authClaims = GetUserClaims(user);
+            var resp = await GenerateToken(user, tokenObj);
+            return Ok(resp);
+        }
+
+        [Authorize]
+        [HttpPost("change-password")]
+        public async Task<IActionResult> ChangePassword(ChangePasswordModelVm req)
+        {
+            _validateChangePassword.ValidateAndThrow(req);
+            var user = await _db.Users.FindAsync(_user.UserId);
+            if (user is null)
+            {
+                return BadRequest("User not found.");
+            }
+            //if(BCrypt.Net.BCrypt.Verify(req.Password, user.Password))
+            //{
+            //    return BadRequest("invalid old password");
+            //}
+            user.Password = BCrypt.Net.BCrypt.HashPassword(req.Password);
+            user.UpdatedDate = DateTime.UtcNow;
+            _db.Entry(user).State = EntityState.Modified;
+            await _db.SaveChangesAsync();
+            return Ok(new { user.UpdatedDate, user.Id });
+        }
+
+        [Authorize]
+        [HttpGet("logout")]
+        public async Task<IActionResult> Revoke()
+        {
+            var count = await _db.UserTokens.Where(x => x.UserId == _user.UserId).ExecuteDeleteAsync();
+            return Ok(new { _user.UserId, tokensDeleted = count });
+        }
+
+        [Authorize]
+        [HttpGet("deactivate")]
+        public async Task<IActionResult> DeActivate()
+        {
+            var user = await _db.Users.FirstOrDefaultAsync(x => x.Id == _user.UserId);
+            if (user == null) return BadRequest("User not found.");
+
+            await _db.UserTokens.Where(x => x.UserId == _user.UserId).ExecuteDeleteAsync();
+
+            user.Status = UserStatus.InActive;
+            user.UpdatedDate = DateTime.UtcNow;
+
+            _db.SaveChanges();
+
+            return Ok(new { UserId = user.Id });
+        }
+        private async Task<object> GenerateToken(User user, UserToken? existingToken = null)
+        {
+            var tokenId = Guid.NewGuid().ToString();
+            var authClaims = new List<Claim>
+                {
+                    new Claim(ClaimTypes.NameIdentifier, user.Id.ToString(), ClaimValueTypes.Integer32),
+                    new Claim(JwtRegisteredClaimNames.Jti, tokenId),
+                };
+            if (!string.IsNullOrEmpty(user.Email))
+                authClaims.Add(new Claim(ClaimTypes.Email, user.Email));
+            foreach (var userRole in user.Roles)
+            {
+                authClaims.Add(new Claim(ClaimTypes.Role, userRole.Role!));
+            }
+            var newAccessToken = GenerateAccessToken(authClaims);
+            var newRefreshToken = await GenerateRefereshToken(user, existingToken);
+            var resp = MapUserAndToken(user, newAccessToken, newRefreshToken);
+            return resp;
+        }
+
+        private async Task<string> GenerateRefereshToken(User user, UserToken? existingToken)
+        {
+            var newRefreshToken = GenerateRandomToken();
+            int.TryParse(_configuration["JWT:RefreshTokenValidityInDays"], out int tokenValidityIndays);
+
+            var token = existingToken ?? new UserToken();
+            token.RefreshToken = newRefreshToken;
+            token.ExpiryTime = DateTime.UtcNow.AddDays(tokenValidityIndays);
+
+            if (existingToken is null)
+            {
+                token.UserId = user.Id;
+                _db.UserTokens.Add(token);
+            }
+
+            await _db.SaveChangesAsync();
+
+            return newRefreshToken;
+        }
+        private async Task<User?> GetUser(string username)
+        {
+            var isUserId = int.TryParse(username, out var userId);
+            var canCon = await _db.Database.CanConnectAsync();
+            var user = await _db.Users.Include(x => x.Roles).FirstOrDefaultAsync(x => x.Email == username || x.Contact == username || (isUserId && x.Id == userId));
+            return user;
+        }
+
+        private object MapUserAndToken(User user, JwtSecurityToken token, string refreshToken)
+        {
+            long ts = (long)(token.ValidTo - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+            var userr = _db.Users.Include(x => x.Roles);
+            return new
+            {
+                user.Id,
+                Roles = user.Roles.Select(x => x.Role),
+                user.Email,
+                user.FirstName,
+                user.LastName,
+                user.Contact,
+                user.CreatedDate,
+                user.UpdatedDate,
+                user.ProfilePhoto,
+                Token = new
+                {
+                    AccessToken = new JwtSecurityTokenHandler().WriteToken(token),
+                    RefreshToken = refreshToken,
+                    Expiration = token.ValidTo,
+                    ExpirationTs = ts
+                },
+
+            };
+        }
+        private JwtSecurityToken GenerateAccessToken(List<Claim> authClaims)
+        {
+            var authSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["JWT:Secret"] ?? ""));
+            _ = int.TryParse(_configuration["JWT:TokenValidityInMinutes"], out int tokenValidityInMinutes);
+
+            var token = new JwtSecurityToken(
+                issuer: _configuration["JWT:ValidIssuer"],
+                audience: _configuration["JWT:ValidAudience"],
+                expires: DateTime.UtcNow.AddMinutes(tokenValidityInMinutes),
+                claims: authClaims,
+                signingCredentials: new SigningCredentials(authSigningKey, SecurityAlgorithms.HmacSha256)
+                );
+
+            return token;
+        }
+        private static string GenerateRandomToken(int size = 32)
+        {
+            var randomNumber = new byte[size];
+            using var rng = RandomNumberGenerator.Create();
+            rng.GetBytes(randomNumber);
+            return Convert.ToHexString(randomNumber).ToLower();
+        }
+        private ClaimsPrincipal? GetPrincipalFromExpiredToken(string? token)
+        {
+            var tokenValidationParameters = new TokenValidationParameters
+            {
+                ValidateAudience = false,
+                ValidateIssuer = false,
+                ValidateIssuerSigningKey = true,
+                IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["JWT:Secret"] ?? "")),
+                ValidateLifetime = false
+            };
+
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var principal = tokenHandler.ValidateToken(token, tokenValidationParameters, out SecurityToken securityToken);
+            if (securityToken is not JwtSecurityToken jwtSecurityToken || !jwtSecurityToken.Header.Alg.Equals(SecurityAlgorithms.HmacSha256, StringComparison.InvariantCultureIgnoreCase))
+                throw new SecurityTokenException("Invalid token");
+
+            return principal;
+        }
+    }
+}
